@@ -6,9 +6,9 @@ case "$2" in
   debian)
     export DEBIAN_FRONTEND=noninteractive
     apt-get update -qq > /dev/null
-    apt-get install -y -qq bash curl > /dev/null ;;
+    apt-get install -y -qq bash curl libatomic1 > /dev/null ;;
   rhel)
-    dnf install --allowerasing -y -q bash curl > /dev/null ;;
+    dnf install --allowerasing -y -q bash curl libatomic > /dev/null ;;
 esac
 [ "$2" = alpine ] || . /v/ci/post-install/_install_nvm.sh
 cat /etc/os-release | grep '^PRETTY_NAME'

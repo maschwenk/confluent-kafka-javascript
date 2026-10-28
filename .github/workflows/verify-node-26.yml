@@ -92,11 +92,12 @@ jobs:
           npm pack --ignore-scripts --silent > /dev/null
           mv confluentinc-kafka-javascript-*.tgz client.tgz
           echo "MIRROR_DIR=mirror/v$version" >> "$GITHUB_ENV"
+      # Artifacts keep their v<version>/ directory, so this lands in MIRROR_DIR.
       - uses: actions/download-artifact@v4
         with:
           pattern: prebuild-linux-*
           merge-multiple: true
-          path: ${{ env.MIRROR_DIR }}
+          path: mirror
       - if: matrix.arch == 's390x'
         uses: docker/setup-qemu-action@v3
         with:
