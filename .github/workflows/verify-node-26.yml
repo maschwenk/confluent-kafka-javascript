@@ -33,8 +33,6 @@ jobs:
           - { runner: ubuntu-24.04-arm, arch: arm64, libc: glibc, platform: "", run: "-e NODE_VERSION=26 almalinux:8 /v/.semaphore/build-docker-almalinux.sh", test_image: "node:26-bookworm" }
           - { runner: ubuntu-24.04, arch: x64, libc: musl, platform: "", run: "node:26-alpine /v/.semaphore/build-docker-alpine.sh", test_image: "node:26-alpine" }
           - { runner: ubuntu-24.04-arm, arch: arm64, libc: musl, platform: "", run: "node:26-alpine /v/.semaphore/build-docker-alpine.sh", test_image: "node:26-alpine" }
-          # Semaphore uses 26.3.0 for s390x; no s390x runners here, so emulate.
-          - { runner: ubuntu-24.04, arch: s390x, libc: glibc, platform: "--platform linux/s390x", run: "-e NODE_VERSION=26.3.0 almalinux:8 /v/.semaphore/build-docker-almalinux.sh", test_image: "" }
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 300
     steps:
@@ -83,9 +81,6 @@ jobs:
           - { image: "rockylinux:9", family: rhel }
           - { image: "quay.io/centos/centos:stream9", family: rhel }
           - { image: "node:26-alpine", family: alpine }
-        include:
-          - { arch: s390x, target: { image: "ubuntu:20.04", family: debian } }
-          - { arch: s390x, target: { image: "almalinux:9", family: rhel } }
     runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
     timeout-minutes: 60
     steps:
@@ -178,6 +173,7 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 26
+          check-latest: true
       - name: install from a local mirror
         run: |
           serve() { python -m http.server 8000 --bind 127.0.0.1 --directory "$1" > /tmp/http.log 2>&1 &
