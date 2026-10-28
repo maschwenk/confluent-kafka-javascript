@@ -1,0 +1,213 @@
+# Throwaway verification for the Node 26 prebuild PR and the librdkafka
+# mklove fix. Mirrors the Semaphore release and post-install steps for Node 26
+# on GitHub-hosted runners. Not part of either PR.
+name: verify node 26
+
+on:
+  push:
+    branches: [node-26-verify]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # Five dev-only lockfile entries resolve from Confluent's private CodeArtifact
+  # mirror; point them at the public registry (same tarballs and integrity).
+  LOCKFILE_FIX: perl -pi -e 's#https://confluent-524708692776\.d\.codeartifact\.us-west-2\.amazonaws\.com/npm/[^/]+/#https://registry.npmjs.org/#g' package-lock.json
+  LIBRDKAFKA_FORK: maschwenk/librdkafka
+  LIBRDKAFKA_BRANCH: mklove-ar-script-paths
+
+jobs:
+  linux:
+    name: release build linux-${{ matrix.libc }}-${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: ubuntu-24.04, arch: x64, libc: glibc, image: "node:26-bullseye", script: build-docker-debian.sh }
+          - { runner: ubuntu-24.04-arm, arch: arm64, libc: glibc, image: "node:26-bullseye", script: build-docker-debian.sh }
+          - { runner: ubuntu-24.04, arch: x64, libc: musl, image: "node:26-alpine", script: build-docker-alpine.sh }
+          - { runner: ubuntu-24.04-arm, arch: arm64, libc: musl, image: "node:26-alpine", script: build-docker-alpine.sh }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - run: ${{ env.LOCKFILE_FIX }}
+      - name: build (same command as the Semaphore release block)
+        run: |
+          touch "$HOME/.npmrc"
+          .semaphore/docker_run_with_volumes.sh ${{ matrix.image }} /v/.semaphore/${{ matrix.script }}
+          ls -la build/stage/*/
+      - name: unit tests (make test) on node 26 in the build image
+        run: docker run --rm -v "$PWD:/v" -w /v ${{ matrix.image }} sh -c 'command -v make > /dev/null || apk add -q make; node -v; make test'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: prebuild-linux-${{ matrix.libc }}-${{ matrix.arch }}
+          path: build/stage/*/*.tar.gz
+
+  post-install-linux:
+    name: post-install ${{ matrix.target.image }} ${{ matrix.arch }}
+    needs: linux
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x64, arm64]
+        target:
+          - { image: "debian:bookworm", family: debian }
+          - { image: "debian:trixie", family: debian }
+          - { image: "ubuntu:20.04", family: debian }
+          - { image: "ubuntu:22.04", family: debian }
+          - { image: "ubuntu:24.04", family: debian }
+          - { image: "ubuntu:26.04", family: debian }
+          - { image: "almalinux:9", family: rhel }
+          - { image: "rockylinux:9", family: rhel }
+          - { image: "quay.io/centos/centos:stream9", family: rhel }
+          - { image: "node:26-alpine", family: alpine }
+    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: mirror the prebuilds and pack the client
+        run: |
+          version=$(node -p 'require("./package.json").version')
+          mkdir -p "mirror/v$version"
+          npm pack --ignore-scripts --silent > /dev/null
+          mv confluentinc-kafka-javascript-*.tgz client.tgz
+          echo "MIRROR_DIR=mirror/v$version" >> "$GITHUB_ENV"
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: prebuild-linux-*
+          merge-multiple: true
+          path: ${{ env.MIRROR_DIR }}
+      - name: install node 26 and load the prebuild
+        run: |
+          ls -la "$MIRROR_DIR"
+          (cd mirror && python3 -m http.server 8000 > /dev/null 2>&1 &)
+          sleep 1
+          docker run --rm --network host -v "$PWD:/v:ro" -v "$PWD/client.tgz:/pkg/client.tgz:ro" \
+            ${{ matrix.target.image }} sh /v/verify-node-26/post-install.sh 26 ${{ matrix.target.family }}
+
+  macos:
+    name: release build + install ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-15, macos-15-intel]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - run: ${{ env.LOCKFILE_FIX }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 26
+      - name: build (same commands as the Semaphore release block)
+        run: |
+          npm ci
+          npx node-pre-gyp package
+          ls -la build/stage/*/
+      - run: make test
+      - name: install from a local mirror
+        run: |
+          npm pack --ignore-scripts --silent > /dev/null
+          (cd build/stage && python3 -m http.server 8000 > /dev/null 2>&1 &)
+          sleep 1
+          sh verify-node-26/install-from-mirror.sh "$PWD"/confluentinc-kafka-javascript-*.tgz
+      - uses: actions/upload-artifact@v4
+        with:
+          name: prebuild-${{ matrix.runner }}
+          path: build/stage/*/*.tar.gz
+
+  windows:
+    name: release build + install windows-x64
+    runs-on: windows-2025
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - run: ${{ env.LOCKFILE_FIX }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 26.3.0
+      - name: build (same commands as the Semaphore release block)
+        shell: pwsh
+        env:
+          NODE_ABI: "147"
+        run: |
+          node --version
+          pip install setuptools
+          if ([int]$env:NODE_ABI -ge 147) { npm install -g node-gyp@13; $env:npm_config_node_gyp = Join-Path (npm root -g) "node-gyp\bin\node-gyp.js" }
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Write-Output "npm_config_node_gyp=$env:npm_config_node_gyp"
+          npm ci
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          npx node-pre-gyp package
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Get-ChildItem build/stage/*/
+      # The release builds against 26.3.0; check the binary loads on the newest 26.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 26
+      - name: install from a local mirror
+        run: |
+          npm pack --ignore-scripts --silent > /dev/null
+          (cd build/stage && python -m http.server 8000 > /dev/null 2>&1 &)
+          sleep 2
+          sh verify-node-26/install-from-mirror.sh "$(cygpath -m "$PWD")"/confluentinc-kafka-javascript-*.tgz
+      - uses: actions/upload-artifact@v4
+        with:
+          name: prebuild-windows-x64
+          path: build/stage/*/*.tar.gz
+
+  librdkafka-at-path:
+    name: librdkafka static build from an '@' path (master vs patched)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.LIBRDKAFKA_FORK }}
+          ref: ${{ env.LIBRDKAFKA_BRANCH }}
+          path: librdkafka
+      - run: |
+          mkdir orig && curl -fsSL https://raw.githubusercontent.com/confluentinc/librdkafka/master/mklove/Makefile.base -o orig/Makefile.base
+          docker run --rm -v "$PWD/librdkafka:/src:ro" -v "$PWD/orig:/orig:ro" -v "$PWD/librdkafka/mklove:/patched:ro" \
+            -v "$PWD/verify-node-26:/s:ro" node:26-bullseye sh /s/rdk-at-path.sh
+
+  source-install:
+    name: npm install from source on node 26 (${{ matrix.makefile }} Makefile.base, ${{ matrix.image }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { makefile: master, expect: fail, image: "node:26-bullseye" }
+          - { makefile: patched, expect: pass, image: "node:26-bullseye" }
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - run: |
+          mkdir mk
+          if [ "${{ matrix.makefile }}" = patched ]; then
+            curl -fsSL "https://raw.githubusercontent.com/$LIBRDKAFKA_FORK/$LIBRDKAFKA_BRANCH/mklove/Makefile.base" -o mk/Makefile.base
+          else
+            cp deps/librdkafka/mklove/Makefile.base mk/Makefile.base
+          fi
+          docker run --rm -v "$PWD:/src:ro" -v "$PWD/mk:/mk:ro" ${{ matrix.image }} \
+            sh /src/verify-node-26/e2e-install.sh /mk/Makefile.base ${{ matrix.expect }}
+
+  recipe-busybox:
+    name: patched recipe under busybox (alpine without coreutils)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          mkdir mk && curl -fsSL "https://raw.githubusercontent.com/$LIBRDKAFKA_FORK/$LIBRDKAFKA_BRANCH/mklove/Makefile.base" -o mk/Makefile.base
+          docker run --rm -v "$PWD/mk:/mk:ro" -v "$PWD/verify-node-26:/s:ro" alpine:latest \
+            sh -c 'apk add -q make binutils gcc musl-dev && sh /s/recipe-check.sh'
