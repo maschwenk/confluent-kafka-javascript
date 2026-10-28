@@ -25,7 +25,8 @@ ar t src/librdkafka-static.a | sort > /w/got
 echo "expected members: $(wc -l < /w/expected), got: $(wc -l < /w/got)"
 cmp -s /w/expected /w/got && echo "MEMBERS MATCH" || { echo "MEMBER MISMATCH"; diff /w/expected /w/got | head; }
 ls -d src/arstatic* 2>/dev/null && echo "LEFTOVER TEMP FILES" || echo "no leftover temp files"
-[ "$before" -ne 0 ] && grep -q 'Syntax error in archive script' /w/before.log || { echo "FAIL: master did not fail at the ar step"; exit 1; }
+echo "--- tail of the master build:"; tail -6 /w/before.log
+[ "$before" -ne 0 ] && grep -q -E 'Syntax error in archive script|file format not recognized' /w/before.log || { echo "FAIL: master did not fail at the ar step"; exit 1; }
 [ "$after" -eq 0 ] || { tail -30 /w/after.log; echo "FAIL: patched build failed"; exit 1; }
 cmp -s /w/expected /w/got || exit 1
 ! ls -d src/arstatic* > /dev/null 2>&1 || exit 1

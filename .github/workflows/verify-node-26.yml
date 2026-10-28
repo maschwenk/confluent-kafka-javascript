@@ -17,6 +17,10 @@ env:
   LOCKFILE_FIX: perl -pi -e 's#https://confluent-524708692776\.d\.codeartifact\.us-west-2\.amazonaws\.com/npm/[^/]+/#https://registry.npmjs.org/#g' package-lock.json
   LIBRDKAFKA_FORK: maschwenk/librdkafka
   LIBRDKAFKA_BRANCH: mklove-ar-script-paths
+  # Serve a directory on 127.0.0.1:8000 and wait until it answers.
+  SERVE: |
+    serve() { python3 -m http.server 8000 --bind 127.0.0.1 --directory "$1" > /tmp/http.log 2>&1 &
+      for i in $(seq 1 30); do curl -sf -o /dev/null http://127.0.0.1:8000/ && return 0; sleep 1; done; cat /tmp/http.log; return 1; }
 
 jobs:
   linux:
@@ -25,23 +29,36 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { runner: ubuntu-24.04, arch: x64, libc: glibc, image: "node:26-bullseye", script: build-docker-debian.sh }
-          - { runner: ubuntu-24.04-arm, arch: arm64, libc: glibc, image: "node:26-bullseye", script: build-docker-debian.sh }
-          - { runner: ubuntu-24.04, arch: x64, libc: musl, image: "node:26-alpine", script: build-docker-alpine.sh }
-          - { runner: ubuntu-24.04-arm, arch: arm64, libc: musl, image: "node:26-alpine", script: build-docker-alpine.sh }
+          - { runner: ubuntu-24.04, arch: x64, libc: glibc, platform: "", run: "-e NODE_VERSION=26 almalinux:8 /v/.semaphore/build-docker-almalinux.sh", test_image: "node:26-bookworm" }
+          - { runner: ubuntu-24.04-arm, arch: arm64, libc: glibc, platform: "", run: "-e NODE_VERSION=26 almalinux:8 /v/.semaphore/build-docker-almalinux.sh", test_image: "node:26-bookworm" }
+          - { runner: ubuntu-24.04, arch: x64, libc: musl, platform: "", run: "node:26-alpine /v/.semaphore/build-docker-alpine.sh", test_image: "node:26-alpine" }
+          - { runner: ubuntu-24.04-arm, arch: arm64, libc: musl, platform: "", run: "node:26-alpine /v/.semaphore/build-docker-alpine.sh", test_image: "node:26-alpine" }
+          # Semaphore uses 26.3.0 for s390x; no s390x runners here, so emulate.
+          - { runner: ubuntu-24.04, arch: s390x, libc: glibc, platform: "--platform linux/s390x", run: "-e NODE_VERSION=26.3.0 almalinux:8 /v/.semaphore/build-docker-almalinux.sh", test_image: "" }
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 300
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: true
       - run: ${{ env.LOCKFILE_FIX }}
+      - if: matrix.arch == 's390x'
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: s390x
       - name: build (same command as the Semaphore release block)
         run: |
           touch "$HOME/.npmrc"
-          .semaphore/docker_run_with_volumes.sh ${{ matrix.image }} /v/.semaphore/${{ matrix.script }}
+          .semaphore/docker_run_with_volumes.sh ${{ matrix.platform }} ${{ matrix.run }}
           ls -la build/stage/*/
-      - name: unit tests (make test) on node 26 in the build image
-        run: docker run --rm -v "$PWD:/v" -w /v ${{ matrix.image }} sh -c 'command -v make > /dev/null || apk add -q make; node -v; make test'
+      - name: symbol versions the addon needs
+        if: matrix.libc == 'glibc'
+        run: |
+          objdump -T build/Release/confluent-kafka-javascript.node | grep -oE 'GLIBC(XX)?_[0-9.]+' | sort -uV | awk -F_ '{max[$1]=$0} END {for (k in max) print "max " max[k]}'
+          readelf -d build/Release/confluent-kafka-javascript.node | grep NEEDED
+      - name: unit tests (make test) on node 26
+        if: matrix.test_image != ''
+        run: docker run --rm -v "$PWD:/v" -w /v ${{ matrix.test_image }} sh -c 'command -v make > /dev/null || apk add -q make; node -v; make test'
       - uses: actions/upload-artifact@v4
         with:
           name: prebuild-linux-${{ matrix.libc }}-${{ matrix.arch }}
@@ -50,6 +67,7 @@ jobs:
   post-install-linux:
     name: post-install ${{ matrix.target.image }} ${{ matrix.arch }}
     needs: linux
+    if: always()
     strategy:
       fail-fast: false
       matrix:
@@ -65,10 +83,14 @@ jobs:
           - { image: "rockylinux:9", family: rhel }
           - { image: "quay.io/centos/centos:stream9", family: rhel }
           - { image: "node:26-alpine", family: alpine }
+        include:
+          - { arch: s390x, target: { image: "ubuntu:20.04", family: debian } }
+          - { arch: s390x, target: { image: "almalinux:9", family: rhel } }
     runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
-      - name: mirror the prebuilds and pack the client
+      - name: mirror dir and packed client
         run: |
           version=$(node -p 'require("./package.json").version')
           mkdir -p "mirror/v$version"
@@ -80,12 +102,17 @@ jobs:
           pattern: prebuild-linux-*
           merge-multiple: true
           path: ${{ env.MIRROR_DIR }}
+      - if: matrix.arch == 's390x'
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: s390x
       - name: install node 26 and load the prebuild
         run: |
+          ${{ env.SERVE }}
           ls -la "$MIRROR_DIR"
-          (cd mirror && python3 -m http.server 8000 > /dev/null 2>&1 &)
-          sleep 1
-          docker run --rm --network host -v "$PWD:/v:ro" -v "$PWD/client.tgz:/pkg/client.tgz:ro" \
+          serve mirror
+          docker run --rm --network host ${{ matrix.arch == 's390x' && '--platform linux/s390x' || '' }} \
+            -v "$PWD:/v:ro" -v "$PWD/client.tgz:/pkg/client.tgz:ro" \
             ${{ matrix.target.image }} sh /v/verify-node-26/post-install.sh 26 ${{ matrix.target.family }}
 
   macos:
@@ -111,9 +138,9 @@ jobs:
       - run: make test
       - name: install from a local mirror
         run: |
+          ${{ env.SERVE }}
           npm pack --ignore-scripts --silent > /dev/null
-          (cd build/stage && python3 -m http.server 8000 > /dev/null 2>&1 &)
-          sleep 1
+          serve build/stage
           sh verify-node-26/install-from-mirror.sh "$PWD"/confluentinc-kafka-javascript-*.tgz
       - uses: actions/upload-artifact@v4
         with:
@@ -141,9 +168,7 @@ jobs:
         run: |
           node --version
           pip install setuptools
-          if ([int]$env:NODE_ABI -ge 147) { npm install -g node-gyp@13; $env:npm_config_node_gyp = Join-Path (npm root -g) "node-gyp\bin\node-gyp.js" }
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          Write-Output "npm_config_node_gyp=$env:npm_config_node_gyp"
+          if ([int]$env:NODE_ABI -ge 147) { $env:npm_config_enable_thin_lto = "false" }
           npm ci
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           npx node-pre-gyp package
@@ -155,9 +180,10 @@ jobs:
           node-version: 26
       - name: install from a local mirror
         run: |
+          serve() { python -m http.server 8000 --bind 127.0.0.1 --directory "$1" > /tmp/http.log 2>&1 &
+            for i in $(seq 1 30); do curl -sf -o /dev/null http://127.0.0.1:8000/ && return 0; sleep 1; done; cat /tmp/http.log; return 1; }
           npm pack --ignore-scripts --silent > /dev/null
-          (cd build/stage && python -m http.server 8000 > /dev/null 2>&1 &)
-          sleep 2
+          serve build/stage
           sh verify-node-26/install-from-mirror.sh "$(cygpath -m "$PWD")"/confluentinc-kafka-javascript-*.tgz
       - uses: actions/upload-artifact@v4
         with:
@@ -177,7 +203,7 @@ jobs:
       - run: |
           mkdir orig && curl -fsSL https://raw.githubusercontent.com/confluentinc/librdkafka/master/mklove/Makefile.base -o orig/Makefile.base
           docker run --rm -v "$PWD/librdkafka:/src:ro" -v "$PWD/orig:/orig:ro" -v "$PWD/librdkafka/mklove:/patched:ro" \
-            -v "$PWD/verify-node-26:/s:ro" node:26-bullseye sh /s/rdk-at-path.sh
+            -v "$PWD/verify-node-26:/s:ro" node:26-bookworm sh /s/rdk-at-path.sh
 
   source-install:
     name: npm install from source on node 26 (${{ matrix.makefile }} Makefile.base, ${{ matrix.image }})
@@ -185,8 +211,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { makefile: master, expect: fail, image: "node:26-bullseye" }
-          - { makefile: patched, expect: pass, image: "node:26-bullseye" }
+          - { makefile: master, expect: fail, image: "node:26-bookworm" }
+          - { makefile: patched, expect: pass, image: "node:26-bookworm" }
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
